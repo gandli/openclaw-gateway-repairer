@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.openclaw.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/user/.openclaw/scripts/gateway-watchdog.sh</string>
+    </array>
+
+    <!-- 每 60 秒运行一次 -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <!-- 随用户登录自动启动 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃后自动重启看门狗本身 -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- 日志输出 -->
+    <key>StandardOutPath</key>
+    <string>/Users/user/.openclaw/logs/watchdog-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/user/.openclaw/logs/watchdog-agent.err</string>
+
+    <!-- 环境变量：确保 homebrew 路径可用 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/user</string>
+    </dict>
+</dict>
+</plist>
