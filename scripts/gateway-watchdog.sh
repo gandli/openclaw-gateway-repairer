@@ -1,12 +1,6 @@
 #!/bin/bash
 # ============================================================
-# OpenClaw Gateway 智能监控系统 v3
-# 修复要点：
-#   - 移除 set -e，防止子命令失败导致脚本意外退出
-#   - 修正健康检查逻辑（双重：status + health RPC 探测）
-#   - 修正 launchctl 检测方式（piped grep）
-#   - 修复流程新增 gateway install 处理
-#   - 移除不存在的 openclaw doctor 命令
+# OpenClaw Gateway 智能监控系统 v4
 # ============================================================
 
 # 注意：不使用 set -e，因为健康检查命令在服务异常时必然返回非零
@@ -14,13 +8,16 @@
 # ============================================================
 # 配置
 # ============================================================
-LOG_DIR="${LOG_DIR:-/Users/user/.openclaw/logs}"
+LOG_DIR="${LOG_DIR:-$HOME/.openclaw/logs}"
 LOG_FILE="${LOG_DIR}/gateway-watchdog.log"
 LOCK_FILE="/tmp/gateway-watchdog.lock"
 QWEN_CLI="${QWEN_CLI:-/opt/homebrew/bin/qwen}"
 NOTIFICATION_CHAT_ID="${NOTIFICATION_CHAT_ID:-944783507}"
 OPENCLAW_SERVICE="ai.openclaw.gateway"
 GATEWAY_LOG="/tmp/openclaw/openclaw-$(date '+%Y-%m-%d').log"
+STATE_FILE="${LOG_DIR}/watchdog-state"
+MAX_LOG_BYTES=$((5 * 1024 * 1024))   # 5MB 日志轮转阈值
+SILENCE_PERIOD=600                    # 连续失败静默期（秒），避免重复通知
 
 # ============================================================
 # macOS 兼容：可靠的 _timeout 实现（后台进程 + kill，不依赖 perl）
@@ -46,6 +43,46 @@ _timeout() {
         kill "$watcher" 2>/dev/null
         return $rc
     fi
+}
+
+# ============================================================
+# 日志轮转：超过 5MB 时保留最近 1000 行
+# ============================================================
+rotate_log() {
+    [ -f "$LOG_FILE" ] || return
+    local size
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$MAX_LOG_BYTES" ]; then
+        local tmp; tmp=$(mktemp)
+        tail -1000 "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+        log "INFO" "日志已轮转（超过 5MB，保留最近 1000 行）"
+    fi
+}
+
+# ============================================================
+# 连续失败计数 + 静默期
+# ============================================================
+get_failures() {
+    local f="${STATE_FILE}.failures"
+    [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0
+}
+inc_failures() {
+    local f="${STATE_FILE}.failures"
+    echo $(( $(get_failures) + 1 )) > "$f"
+}
+reset_failures() {
+    rm -f "${STATE_FILE}.failures" "${STATE_FILE}.last_notify"
+}
+in_silence_period() {
+    local ts_file="${STATE_FILE}.last_notify"
+    [ -f "$ts_file" ] || return 1
+    local last now
+    last=$(cat "$ts_file" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    [ $(( now - last )) -lt "$SILENCE_PERIOD" ]
+}
+mark_notified() {
+    date +%s > "${STATE_FILE}.last_notify"
 }
 
 # ============================================================
@@ -214,27 +251,15 @@ qwen_diagnose_and_fix() {
 repair_gateway() {
     log "INFO" "开始修复流程..."
 
-    # 场景 A：服务未安装（plist 不存在）→ 安装并启动
-    if ! is_service_installed; then
-        log "WARN" "⚠️  LaunchAgent 未安装，执行 openclaw gateway install..."
-        if openclaw gateway install >> "$LOG_FILE" 2>&1; then
-            log "INFO" "安装完成，等待启动..."
-            sleep 5
-        else
-            log "ERROR" "❌ openclaw gateway install 失败"
-            send_notification "❌ Gateway 安装失败" "请手动运行: openclaw gateway install"
-            return 1
-        fi
-
-    # 场景 B：服务已安装但未加载 → install（可同时处理 plist 丢失和未加载两种情况）
-    elif ! is_service_loaded; then
-        log "WARN" "⚠️  LaunchAgent 未加载，执行 openclaw gateway install..."
+    # 场景 A/B 合并：未安装或未加载 → gateway install（统一处理）
+    if ! is_service_installed || ! is_service_loaded; then
+        log "WARN" "⚠️  LaunchAgent 未安装/未加载，执行 openclaw gateway install..."
         if openclaw gateway install >> "$LOG_FILE" 2>&1; then
             log "INFO" "install 完成，等待启动..."
             sleep 5
         else
             log "ERROR" "❌ openclaw gateway install 失败"
-            send_notification "❌ Gateway 重启失败" "请手动运行: openclaw gateway restart"
+            send_notification "❌ Gateway 安装失败" "请手动运行: openclaw gateway install"
             return 1
         fi
 
@@ -247,13 +272,12 @@ repair_gateway() {
         if echo "$restart_out" | grep -qi "not loaded"; then
             log "WARN" "restart 报告服务未加载，降级为 uninstall + install"
             openclaw gateway uninstall >> "$LOG_FILE" 2>&1 || true
-            openclaw gateway install  >> "$LOG_FILE" 2>&1 || true
+            openclaw gateway install   >> "$LOG_FILE" 2>&1 || true
         fi
         log "INFO" "等待 Gateway 重启（最多 30 秒）..."
         local waited=0
         while [ $waited -lt 30 ]; do
-            sleep 5
-            waited=$((waited + 5))
+            sleep 5; waited=$((waited + 5))
             if check_health_rpc; then
                 log "INFO" "✅ RPC 已恢复（${waited}s）"
                 break
@@ -298,26 +322,41 @@ main() {
     mkdir -p "$LOG_DIR"
     acquire_lock
     trap release_lock EXIT
+    rotate_log
 
     log "INFO" "========== 健康检查 =========="
 
     if health_check; then
+        reset_failures
         exit 0
     fi
 
-    # 健康检查失败
-    log "WARN" "检测到问题，启动 qwen 智能修复..."
+    # 健康检查失败：累积计数
+    inc_failures
+    local fail_count; fail_count=$(get_failures)
+    log "WARN" "检测到问题（连续第 ${fail_count} 次），启动 qwen 智能修复..."
 
     # 优先让 qwen 诊断并执行修复命令
     if qwen_diagnose_and_fix; then
         log "INFO" "✅ qwen 修复成功"
-        send_notification "✅ Gateway 已自动修复" "qwen 智能修复成功"
+        reset_failures
+        send_notification "✅ Gateway 已自动修复" "qwen 智能修复成功（连续失败 ${fail_count} 次后）"
         exit 0
     fi
 
     # qwen 不可用或修复失败 → 降级到固定修复流程
     log "WARN" "qwen 修复未生效，执行标准修复流程..."
-    repair_gateway
+    if repair_gateway; then
+        reset_failures
+    else
+        # 修复失败：静默期内不重复通知
+        if ! in_silence_period; then
+            send_notification "❌ Gateway 修复失败（连续 ${fail_count} 次）" "自动修复无效，请手动检查"
+            mark_notified
+        else
+            log "INFO" "静默期内，跳过重复通知（连续失败 ${fail_count} 次）"
+        fi
+    fi
 }
 
 # ============================================================
