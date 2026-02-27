@@ -14,6 +14,8 @@ LOCK_FILE="/tmp/gateway-watchdog.lock"
 QWEN_CLI="${QWEN_CLI:-/opt/homebrew/bin/qwen}"
 NOTIFICATION_CHAT_ID="${NOTIFICATION_CHAT_ID:-944783507}"
 OPENCLAW_SERVICE="ai.openclaw.gateway"
+# GATEWAY_LOG 预留给未来使用
+# shellcheck disable=SC2034
 GATEWAY_LOG="/tmp/openclaw/openclaw-$(date '+%Y-%m-%d').log"
 STATE_FILE="${LOG_DIR}/watchdog-state"
 MAX_LOG_BYTES=$((5 * 1024 * 1024))   # 5MB 日志轮转阈值
@@ -87,7 +89,8 @@ mark_notified() {
 
 # ============================================================
 log() {
-    local line="[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2"
+    local line
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2"
     echo "$line" >> "$LOG_FILE"
     # 仅在交互终端时输出到 stdout（避免 LaunchAgent 双写）
     [ -t 1 ] && echo "$line"
@@ -362,6 +365,13 @@ main() {
 # ============================================================
 # 命令行接口
 # ============================================================
+# --source-only 用于单元测试，只加载函数不执行
+# shellcheck disable=SC2317  # return 在 source 时可达
+if [ "${1:-}" = "--source-only" ]; then
+    return 0 2>/dev/null
+    exit 0  # 直接执行时的后备
+fi
+
 case "${1:-}" in
     status)
         check_status_text && echo "✅ 状态正常" || echo "❌ 状态异常"
